@@ -408,6 +408,8 @@ def load_depth_pipeline():
 
 def preprocess_image(image: Image.Image, target_res: int) -> Image.Image:
     """Prepare image for depth estimation with SculptOK-style optimizations."""
+    import cv2
+    
     # Normalize luminance and contrast
     img_arr = np.array(image)
 
@@ -441,32 +443,54 @@ def preprocess_image(image: Image.Image, target_res: int) -> Image.Image:
     return result.resize((target_res, target_res), Image.LANCZOS)
 
 
-def multiscale_depth_estimation(image: Image.Image, target_res: int, levels: int = 4) -> List[Image.Image]:
+def multiscale_depth_estimation(image: Image.Image, target_res: int, levels: int = 5) -> List[Image.Image]:
     """
-    SculptOK-style multi-scale depth estimation.
-    Run at different input scales to capture detail at multiple levels.
+    Optimized SculptOK-style multi-scale depth estimation with Adaptive Scale Selection.
+    Intelligently chooses scales based on image content to capture detail at multiple levels.
     """
     pipe = load_depth_pipeline()
-    scales = list(range(levels))
     depths = []
 
-    # Preprocess at full resolution for Layer 0 (original image luminance)
-    base_gray = preprocess_image(image, target_res)
+    # 1. Generate base grayscale with enhanced local contrast
+    arr = np.array(preprocess_image(image, target_res), dtype=np.float32)
+    arr = (arr - 128)  # Center around mid-gray
 
-    # Save original as Layer 0
-    depths.append(base_gray.copy())
+    # 2. Determine optimal scales based on image entropy/feature richness
+    h, w = arr.shape
+    entropy_est = np.std(arr) / 50.0  # Simple entropy proxy
+    min_size = min(h, w)
 
-    # Generate different scales for deeper layers
-    for level in range(1, levels):
-        # Use different scale based on difficulty
-        resize_factor = 0.6 ** level  # aggressive shrinking
-        w = max(int(image.width * resize_factor), 64)
-        h = max(int(image.height * resize_factor), 64)
+    # Scale selection: more scales for detailed images
+    if entropy_est > 1.2:
+        scales = [0.85, 0.70, 0.55, 0.40, 0.25]  # High detail image
+    elif entropy_est > 0.8:
+        scales = [0.80, 0.65, 0.50, 0.35, 0.20]  # Medium detail image
+    elif entropy_est > 0.5:
+        scales = [0.75, 0.60, 0.45, 0.30, 0.15]  # Low detail image
+    else:
+        scales = [0.80, 0.65, 0.50]  # Very low detail
 
-        small = image.resize((w, h), Image.LANCZOS)
+    # Save preprocessed result as base layer
+    depths.append(Image.fromarray(np.uint8(np.clip(arr + 128, 0, 255)), mode="L"))
 
-        # Run depth estimation at this scale
-        result = pipe(small)
+    # Generate different scales using intelligent resizing and depth estimation
+    for i, scale in enumerate(scales):
+        if scale <= 0.2:
+            break  # Don't go too small
+
+        # Adaptive crop based on scale - preserves aspect ratio
+        crop_w = max(int(w * scale), 64)
+        crop_h = max(int(h * scale), 64)
+
+        # Maintain aspect ratio - center crop
+        cx, cy = w // 2, h // 2
+        x1, y1 = max(0, cx - crop_w // 2), max(0, cy - crop_h // 2)
+        x2, y2 = min(w, x1 + crop_w), min(h, y1 + crop_h)
+
+        crop = Image.fromarray(np.uint8(np.clip(arr + 128, 0, 255))).crop((x1, y1, x2, y2))
+
+        # Run depth estimation on this scale
+        result = pipe(crop)
         depth = result["depth"].resize((target_res, target_res), Image.LANCZOS)
         depths.append(depth)
 
