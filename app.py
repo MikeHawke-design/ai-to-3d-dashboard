@@ -444,53 +444,21 @@ def preprocess_image(image: Image.Image, target_res: int) -> Image.Image:
 
 
 def multiscale_depth_estimation(image: Image.Image, target_res: int, levels: int = 5) -> List[Image.Image]:
-    """
-    Optimized SculptOK-style multi-scale depth estimation with Adaptive Scale Selection.
-    Intelligently chooses scales based on image content to capture detail at multiple levels.
-    """
+    """Multi-scale depth: runs depth at different input resolutions, blends all."""
     pipe = load_depth_pipeline()
     depths = []
 
-    # 1. Generate base grayscale with enhanced local contrast
-    arr = np.array(preprocess_image(image, target_res), dtype=np.float32)
-    arr = (arr - 128)  # Center around mid-gray
+    # Base layer: preprocessed grayscale
+    base_gray = preprocess_image(image, target_res)
+    depths.append(base_gray)
 
-    # 2. Determine optimal scales based on image entropy/feature richness
-    h, w = arr.shape
-    entropy_est = np.std(arr) / 50.0  # Simple entropy proxy
-    min_size = min(h, w)
-
-    # Scale selection: more scales for detailed images
-    if entropy_est > 1.2:
-        scales = [0.85, 0.70, 0.55, 0.40, 0.25]  # High detail image
-    elif entropy_est > 0.8:
-        scales = [0.80, 0.65, 0.50, 0.35, 0.20]  # Medium detail image
-    elif entropy_est > 0.5:
-        scales = [0.75, 0.60, 0.45, 0.30, 0.15]  # Low detail image
-    else:
-        scales = [0.80, 0.65, 0.50]  # Very low detail
-
-    # Save preprocessed result as base layer
-    depths.append(Image.fromarray(np.uint8(np.clip(arr + 128, 0, 255)), mode="L"))
-
-    # Generate different scales using intelligent resizing and depth estimation
-    for i, scale in enumerate(scales):
-        if scale <= 0.2:
-            break  # Don't go too small
-
-        # Adaptive crop based on scale - preserves aspect ratio
-        crop_w = max(int(w * scale), 64)
-        crop_h = max(int(h * scale), 64)
-
-        # Maintain aspect ratio - center crop
-        cx, cy = w // 2, h // 2
-        x1, y1 = max(0, cx - crop_w // 2), max(0, cy - crop_h // 2)
-        x2, y2 = min(w, x1 + crop_w), min(h, y1 + crop_h)
-
-        crop = Image.fromarray(np.uint8(np.clip(arr + 128, 0, 255))).crop((x1, y1, x2, y2))
-
-        # Run depth estimation on this scale
-        result = pipe(crop)
+    # Depth at different scales (smaller input = coarser features captured)
+    for i in range(levels - 1):
+        scale = 1.0 - (i * 0.15)
+        w = max(int(image.width * scale), 64)
+        h = max(int(image.height * scale), 64)
+        small = image.resize((w, h), Image.LANCZOS)
+        result = pipe(small)
         depth = result["depth"].resize((target_res, target_res), Image.LANCZOS)
         depths.append(depth)
 
@@ -511,41 +479,35 @@ def generate_depth_map(
     with st.spinner("Running multi-scale depth analysis..."):
         depth_layers = multiscale_depth_estimation(image, resolution, levels=4)
 
-    # 2. Blend layers intelligently (based on SculptOK's 4 versions)
-    base = np.array(depth_layers[0], dtype=np.float64)  # Original image luminance
-    layer1 = np.array(depth_layers[1], dtype=np.float64)  # Full depth
-    layer2 = np.array(depth_layers[2], dtype=np.float64)  # Medium depth
-    layer3 = np.array(depth_layers[3], dtype=np.float64)  # Coarse depth
-
-    # Smart blending - emphasize original detail, add depth from different scales
-    combined = (
-        base * 0.25 +
-        layer1 * 0.25 +
-        layer2 * 0.25 +
-        layer3 * 0.25
-    )
+    # 2. Blend all layers equally (SculptOK style)
+    n = len(depth_layers)
+    combined = sum(np.array(d, dtype=np.float32) for d in depth_layers) / n
 
     # 3. Enhanced contrast analysis (CLAHE)
     if clahe_clip > 0:
-        combined = (combined - 128)  # Center around mean luminance
+        combined = np.clip(combined, 0, 255).astype(np.float32)
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-        combined = clahe.apply(np.uint8(combined))
-        combined = combined.astype(np.float64) - 128
+        combined = clahe.apply(combined.astype(np.uint8)).astype(np.float32)
 
     # 4. Edge-preserving smoothing (SculptOK style)
     if smooth_edges > 0:
         d = max(int(smooth_edges * 5), 1)
         sigma = max(smooth_edges * 8, 0.1)
+        combined = np.clip(combined, 0, 255).astype(np.float32)
         combined = cv2.bilateralFilter(combined, d, sigmaColor=sigma, sigmaSpace=sigma)
 
     # 5. Detail enhancement (only if user requested)
     if detail_boost > 0:
+        combined = np.clip(combined, 0, 255).astype(np.float32)
         blurred = cv2.GaussianBlur(combined, (7, 7), 1.5)
         detail = combined - blurred
         combined = combined + detail * detail_boost
 
     # Normalize to 0-255
-    combined = (combined - combined.min()) / (combined.max() - combined.min() + 1e-6) * 255.0
+    combined = np.clip(combined, 0, 255).astype(np.float32)
+    mn, mx = combined.min(), combined.max()
+    if mx > mn:
+        combined = (combined - mn) / (mx - mn) * 255.0
 
     return Image.fromarray(np.uint8(combined), mode="L")
 
