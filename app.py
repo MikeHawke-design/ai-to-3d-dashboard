@@ -396,10 +396,81 @@ No explanations, no markdown."""
 # DEPTH MAP ENGINE
 # ---------------------------------------------------------
 
+# ---------------------------------------------------------
+# DEPTH MAP ENGINE
+# ---------------------------------------------------------
+
 @st.cache_resource(show_spinner="Loading AI depth model (~700MB)...")
 def load_depth_pipeline():
     from transformers import pipeline
     return pipeline("depth-estimation", model="depth-anything/Depth-Anything-V2-Large-hf")
+
+
+def preprocess_image(image: Image.Image, target_res: int) -> Image.Image:
+    """Prepare image for depth estimation with SculptOK-style optimizations."""
+    # Normalize luminance and contrast
+    img_arr = np.array(image)
+
+    # Convert to grayscale intelligently based on image type
+    if len(img_arr.shape) == 3 and img_arr.shape[2] == 3:
+        # RGB -> Convert using Luminance formula (0.299R + 0.587G + 0.114B)
+        gray = np.dot(img_arr[...,:3], [0.299, 0.587, 0.114]).astype(np.uint8)
+    elif len(img_arr.shape) == 2:
+        gray = img_arr
+    else:
+        gray = img_arr[:, :, 0]
+
+    # Adaptive histogram equalization for better contrast
+    gray = gray.astype(np.float32)
+
+    # Clip outliers and enhance local contrast
+    p2, p98 = np.percentile(gray, [2, 98])
+    gray = np.clip(gray, p2, p98)
+
+    # Enhance contrast based on image type
+    if np.std(gray) < 20:  # Low contrast images
+        gray = (gray - np.mean(gray)) * 2 + np.mean(gray)
+
+    # Apply slight unsharp mask to preserve edges
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    unsharp = gray - blurred
+    gray = np.clip(gray + unsharp * 0.3, 0, 255)
+
+    # Final resize with smooth interpolation
+    result = Image.fromarray(np.uint8(gray), mode="L")
+    return result.resize((target_res, target_res), Image.LANCZOS)
+
+
+def multiscale_depth_estimation(image: Image.Image, target_res: int, levels: int = 4) -> List[Image.Image]:
+    """
+    SculptOK-style multi-scale depth estimation.
+    Run at different input scales to capture detail at multiple levels.
+    """
+    pipe = load_depth_pipeline()
+    scales = list(range(levels))
+    depths = []
+
+    # Preprocess at full resolution for Layer 0 (original image luminance)
+    base_gray = preprocess_image(image, target_res)
+
+    # Save original as Layer 0
+    depths.append(base_gray.copy())
+
+    # Generate different scales for deeper layers
+    for level in range(1, levels):
+        # Use different scale based on difficulty
+        resize_factor = 0.6 ** level  # aggressive shrinking
+        w = max(int(image.width * resize_factor), 64)
+        h = max(int(image.height * resize_factor), 64)
+
+        small = image.resize((w, h), Image.LANCZOS)
+
+        # Run depth estimation at this scale
+        result = pipe(small)
+        depth = result["depth"].resize((target_res, target_res), Image.LANCZOS)
+        depths.append(depth)
+
+    return depths
 
 
 def generate_depth_map(
@@ -409,37 +480,50 @@ def generate_depth_map(
     smooth_edges: float = 0.0,
     clahe_clip: float = 2.0,
 ) -> Image.Image:
-    """Professional-grade depth estimation with OpenCV post-processing."""
+    """Professional-grade depth estimation with SculptOK-style multi-scale analysis."""
     import cv2
 
-    pipe = load_depth_pipeline()
+    # 1. Multi-scale depth estimation for richer detail
+    with st.spinner("Running multi-scale depth analysis..."):
+        depth_layers = multiscale_depth_estimation(image, resolution, levels=4)
 
-    # Run depth at high resolution for best detail
-    infer_size = min(max(image.width, image.height), 1024)
-    infer_img = image.resize((infer_size, infer_size), Image.LANCZOS)
-    result = pipe(infer_img)
-    depth = result["depth"].convert("L")
-    depth = depth.resize((resolution, resolution), Image.LANCZOS)
-    arr = np.array(depth, dtype=np.uint8)
+    # 2. Blend layers intelligently (based on SculptOK's 4 versions)
+    base = np.array(depth_layers[0], dtype=np.float64)  # Original image luminance
+    layer1 = np.array(depth_layers[1], dtype=np.float64)  # Full depth
+    layer2 = np.array(depth_layers[2], dtype=np.float64)  # Medium depth
+    layer3 = np.array(depth_layers[3], dtype=np.float64)  # Coarse depth
 
-    # CLAHE: local contrast enhancement to reveal fine details
+    # Smart blending - emphasize original detail, add depth from different scales
+    combined = (
+        base * 0.25 +
+        layer1 * 0.25 +
+        layer2 * 0.25 +
+        layer3 * 0.25
+    )
+
+    # 3. Enhanced contrast analysis (CLAHE)
     if clahe_clip > 0:
+        combined = (combined - 128)  # Center around mean luminance
         clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-        arr = clahe.apply(arr)
+        combined = clahe.apply(np.uint8(combined))
+        combined = combined.astype(np.float64) - 128
 
-    # Edge-preserving bilateral filter (smooths noise, keeps edges sharp)
+    # 4. Edge-preserving smoothing (SculptOK style)
     if smooth_edges > 0:
-        d = max(int(smooth_edges * 10), 1)
-        sigma = max(smooth_edges * 5, 0.1)
-        arr = cv2.bilateralFilter(arr, d, sigma, sigma)
+        d = max(int(smooth_edges * 5), 1)
+        sigma = max(smooth_edges * 8, 0.1)
+        combined = cv2.bilateralFilter(combined, d, sigmaColor=sigma, sigmaSpace=sigma)
 
-    # Detail enhancement (unsharp mask via cv2)
+    # 5. Detail enhancement (only if user requested)
     if detail_boost > 0:
-        blurred = cv2.GaussianBlur(arr.astype(np.float64), (0, 0), 1.5)
-        detail = arr.astype(np.float64) - blurred
-        arr = np.clip(arr.astype(np.float64) + detail * detail_boost, 0, 255).astype(np.uint8)
+        blurred = cv2.GaussianBlur(combined, (7, 7), 1.5)
+        detail = combined - blurred
+        combined = combined + detail * detail_boost
 
-    return Image.fromarray(arr, mode="L")
+    # Normalize to 0-255
+    combined = (combined - combined.min()) / (combined.max() - combined.min() + 1e-6) * 255.0
+
+    return Image.fromarray(np.uint8(combined), mode="L")
 
 
 # ---------------------------------------------------------
