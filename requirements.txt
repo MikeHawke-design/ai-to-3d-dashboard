@@ -5,3 +5,7 @@ numpy-stl>=3.1.0
 numpy>=1.26.0
 Pillow>=10.0.0
 scipy>=1.11.0
+transformers>=4.35.0
+torch>=2.1.0
+opencv-python>=4.8.0
+shapely>=2.0.0

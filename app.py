@@ -16,6 +16,9 @@ from stl import mesh as stl_mesh, Mode as StlMode
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
+from depth_optimizer import DepthPipeline, DepthOptimizer
+from mesh_optimizer import MeshValidator
+
 # ---------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------
@@ -345,56 +348,71 @@ OR for custom geometry:
 No explanations, no markdown."""
 
     import time as _time
+    last_error = None
     for attempt in range(3):
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Generate a 3D model of: {prompt}"},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 500,
-            },
-            timeout=30,
-        )
-        if resp.status_code == 429 and attempt < 2:
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Generate a 3D model of: {prompt}"},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 500,
+                },
+                timeout=30,
+            )
+            if resp.status_code == 429 and attempt < 2:
+                retry_after = int(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
+                _time.sleep(retry_after)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            spec = json.loads(content)
+
+            if spec.get("type") == "primitive":
+                s = spec.get("shape", "box")
+                p = spec.get("params", {})
+                if s == "box":
+                    return trimesh.primitives.Box(extents=[p.get("w", 30), p.get("d", 30), p.get("h", 30)])
+                elif s == "cylinder":
+                    return trimesh.primitives.Cylinder(radius=p.get("r", 15), height=p.get("h", 20), sections=32)
+                elif s == "sphere":
+                    return trimesh.primitives.Sphere(radius=p.get("r", 15), subdivisions=3)
+            elif spec.get("type") == "extrude":
+                pts = spec.get("points", [])
+                h = spec.get("height", 10)
+                if len(pts) >= 3:
+                    return extrude_shape(pts, h)
+
+            return trimesh.primitives.Box(extents=[30, 30, 30])
+
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Connection failed: {e}"
             _time.sleep(2 ** attempt)
-            continue
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-        spec = json.loads(content)
+        except requests.exceptions.Timeout as e:
+            last_error = f"Request timed out: {e}"
+            _time.sleep(2 ** attempt)
+        except json.JSONDecodeError as e:
+            last_error = f"Invalid JSON from AI: {e}"
+            _time.sleep(1)
+        except KeyError as e:
+            last_error = f"Unexpected response format: missing {e}"
+            _time.sleep(1)
+        except Exception as e:
+            last_error = str(e)
+            _time.sleep(2 ** attempt)
 
-        if spec["type"] == "primitive":
-            s = spec["shape"]
-            p = spec.get("params", {})
-            if s == "box":
-                return trimesh.primitives.Box(extents=[p.get("w", 30), p.get("d", 30), p.get("h", 30)])
-            elif s == "cylinder":
-                return trimesh.primitives.Cylinder(radius=p.get("r", 15), height=p.get("h", 20), sections=32)
-            elif s == "sphere":
-                return trimesh.primitives.Sphere(radius=p.get("r", 15), subdivisions=3)
-        elif spec["type"] == "extrude":
-            pts = spec.get("points", [])
-            h = spec.get("height", 10)
-            if len(pts) >= 3:
-                return extrude_shape(pts, h)
+    raise RuntimeError(f"OpenRouter generation failed after 3 attempts. Last error: {last_error}")
 
-        return trimesh.primitives.Box(extents=[30, 30, 30])
-
-    return trimesh.primitives.Box(extents=[30, 30, 30])
-
-
-# ---------------------------------------------------------
-# DEPTH MAP ENGINE
-# ---------------------------------------------------------
 
 # ---------------------------------------------------------
 # DEPTH MAP ENGINE
@@ -443,24 +461,20 @@ def preprocess_image(image: Image.Image, target_res: int) -> Image.Image:
     return result.resize((target_res, target_res), Image.LANCZOS)
 
 
-def multiscale_depth_estimation(image: Image.Image, target_res: int, levels: int = 5) -> List[Image.Image]:
-    """Multi-scale depth: runs depth at different input resolutions, blends all."""
+def multiscale_depth_estimation(image: Image.Image, target_res: int, levels: int = 4) -> List[np.ndarray]:
+    """Multi-scale depth: runs AI depth at 4 input resolutions, returns numpy arrays."""
     pipe = load_depth_pipeline()
     depths = []
 
-    # Base layer: preprocessed grayscale
-    base_gray = preprocess_image(image, target_res)
-    depths.append(base_gray)
-
-    # Depth at different scales (smaller input = coarser features captured)
-    for i in range(levels - 1):
-        scale = 1.0 - (i * 0.15)
+    # 4 AI depth layers at scales: 100%, 85%, 70%, 55%
+    scales = [1.0 - (i * 0.15) for i in range(levels)]
+    for scale in scales:
         w = max(int(image.width * scale), 64)
         h = max(int(image.height * scale), 64)
         small = image.resize((w, h), Image.LANCZOS)
         result = pipe(small)
         depth = result["depth"].resize((target_res, target_res), Image.LANCZOS)
-        depths.append(depth)
+        depths.append(np.array(depth, dtype=np.float32))
 
     return depths
 
@@ -472,38 +486,36 @@ def generate_depth_map(
     smooth_edges: float = 0.0,
     clahe_clip: float = 2.0,
 ) -> Image.Image:
-    """Professional-grade depth estimation with SculptOK-style multi-scale analysis."""
+    """4-layer AI depth estimation with detail-aware blending + full post-processing pipeline."""
     import cv2
 
-    # 1. Multi-scale depth estimation for richer detail
-    with st.spinner("Running multi-scale depth analysis..."):
+    # 1. Multi-scale depth: 4 AI depth layers at 100%, 85%, 70%, 55% resolution
+    with st.spinner("Running 4-layer multi-scale depth analysis..."):
         depth_layers = multiscale_depth_estimation(image, resolution, levels=4)
 
-    # 2. Blend all layers equally (SculptOK style)
-    n = len(depth_layers)
-    combined = sum(np.array(d, dtype=np.float32) for d in depth_layers) / n
+    # 2. Detail-aware blending (Laplacian-based weights — higher detail = higher weight)
+    combined = DepthOptimizer.multi_scale_blend(depth_layers)
 
-    # 3. Enhanced contrast analysis (CLAHE)
-    if clahe_clip > 0:
-        combined = np.clip(combined, 0, 255).astype(np.float32)
-        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-        combined = clahe.apply(combined.astype(np.uint8)).astype(np.float32)
+    # 3. Full post-processing pipeline (outliers → bilateral → morph → edge-aware → CLAHE → sharpen)
+    pipeline = DepthPipeline()
+    combined = pipeline.process(
+        combined,
+        remove_outliers=True,
+        bilateral_denoise=True,
+        edge_aware_smooth=True,
+        clahe_enhance=True,
+        sharpen=True,
+        morph_close=True,
+    )
 
-    # 4. Edge-preserving smoothing (SculptOK style)
-    if smooth_edges > 0:
-        d = max(int(smooth_edges * 5), 1)
-        sigma = max(smooth_edges * 8, 0.1)
-        combined = np.clip(combined, 0, 255).astype(np.float32)
-        combined = cv2.bilateralFilter(combined, d, sigmaColor=sigma, sigmaSpace=sigma)
-
-    # 5. Detail enhancement (only if user requested)
+    # 4. User-requested detail boost (unsharp mask on top of pipeline output)
     if detail_boost > 0:
         combined = np.clip(combined, 0, 255).astype(np.float32)
         blurred = cv2.GaussianBlur(combined, (7, 7), 1.5)
         detail = combined - blurred
         combined = combined + detail * detail_boost
 
-    # Normalize to 0-255
+    # 5. Normalize to 0-255
     combined = np.clip(combined, 0, 255).astype(np.float32)
     mn, mx = combined.min(), combined.max()
     if mx > mn:
@@ -552,77 +564,75 @@ def image_to_heightmap(
         z = gaussian_filter(z, sigma=smooth_sigma)
 
     ny, nx = z.shape
-    verts = []
-    faces = []
 
-    for y in range(ny):
-        for x in range(nx):
-            verts.append([float(x), float(y), float(z[y, x])])
+    # Vectorized vertex generation via meshgrid
+    xGrid, yGrid = np.meshgrid(np.arange(nx, dtype=np.float64), np.arange(ny, dtype=np.float64))
+    verts_top = np.stack([xGrid.ravel(), yGrid.ravel(), z.ravel()], axis=1)
 
-    for y in range(ny - 1):
-        for x in range(nx - 1):
-            i0 = y * nx + x
-            i1 = y * nx + (x + 1)
-            i2 = (y + 1) * nx + x
-            i3 = (y + 1) * nx + (x + 1)
-            faces.append([i0, i1, i2])
-            faces.append([i1, i3, i2])
-
-    verts = np.array(verts, dtype=np.float64)
-    faces = np.array(faces, dtype=np.int32)
-
-    top_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    # Vectorized face generation
+    yy, xx = np.mgrid[0 : ny - 1, 0 : nx - 1]
+    i0 = (yy * nx + xx).ravel()
+    i1 = (yy * nx + xx + 1).ravel()
+    i2 = ((yy + 1) * nx + xx).ravel()
+    i3 = ((yy + 1) * nx + xx + 1).ravel()
+    faces_top = np.column_stack([
+        np.stack([i0, i1, i2], axis=1),
+        np.stack([i1, i3, i2], axis=1),
+    ]).reshape(-1, 3)
 
     if base_thickness > 0:
-        bottom_verts = verts.copy()
-        bottom_verts[:, 2] = -base_thickness
-        offset = len(verts)
-        all_verts = np.vstack([verts, bottom_verts])
-        all_faces = list(faces)
+        verts_bottom = verts_top.copy()
+        verts_bottom[:, 2] = -base_thickness
+        offset = len(verts_top)
+        all_verts = np.vstack([verts_top, verts_bottom])
 
-        for y in range(ny - 1):
-            for x in range(nx - 1):
-                i0 = offset + y * nx + x
-                i1 = offset + y * nx + (x + 1)
-                i2 = offset + (y + 1) * nx + x
-                i3 = offset + (y + 1) * nx + (x + 1)
-                all_faces.append([i0, i2, i1])
-                all_faces.append([i1, i2, i3])
+        # Bottom face (reversed winding)
+        faces_bottom = faces_top[:, ::-1] + offset
 
-        for x in range(nx - 1):
-            t0 = x
-            t1 = x + 1
-            b0 = offset + x
-            b1 = offset + x + 1
-            all_faces.append([t0, t1, b0])
-            all_faces.append([t1, b1, b0])
+        # Side faces — top edge
+        t_top = np.arange(nx - 1)
+        b_top = offset + t_top
+        t_next = np.arange(1, nx)
+        b_next = offset + t_next
+        sides_top = np.column_stack([
+            t_top, t_next, b_top,
+            t_next, b_next, b_top,
+        ]).reshape(-1, 3)
 
-            t0b = (ny - 1) * nx + x
-            t1b = (ny - 1) * nx + x + 1
-            b0b = offset + (ny - 1) * nx + x
-            b1b = offset + (ny - 1) * nx + x + 1
-            all_faces.append([t0b, b0b, t1b])
-            all_faces.append([t1b, b0b, b1b])
+        # Side faces — bottom edge
+        t0b = (ny - 1) * nx + np.arange(nx - 1)
+        t1b = (ny - 1) * nx + np.arange(1, nx)
+        b0b = offset + t0b
+        b1b = offset + t1b
+        sides_bottom = np.column_stack([
+            t0b, b0b, t1b,
+            t1b, b0b, b1b,
+        ]).reshape(-1, 3)
 
-        for y in range(ny - 1):
-            t0l = y * nx
-            t1l = (y + 1) * nx
-            b0l = offset + y * nx
-            b1l = offset + (y + 1) * nx
-            all_faces.append([t0l, b0l, t1l])
-            all_faces.append([t1l, b0l, b1l])
+        # Side faces — left edge
+        t0l = np.arange(ny - 1) * nx
+        t1l = np.arange(1, ny) * nx
+        b0l = offset + t0l
+        b1l = offset + t1l
+        sides_left = np.column_stack([
+            t0l, b0l, t1l,
+            t1l, b0l, b1l,
+        ]).reshape(-1, 3)
 
-            t0r = y * nx + (nx - 1)
-            t1r = (y + 1) * nx + (nx - 1)
-            b0r = offset + y * nx + (nx - 1)
-            b1r = offset + (y + 1) * nx + (nx - 1)
-            all_faces.append([t0r, t1r, b0r])
-            all_faces.append([t1r, b1r, b0r])
+        # Side faces — right edge
+        t0r = np.arange(ny - 1) * nx + (nx - 1)
+        t1r = np.arange(1, ny) * nx + (nx - 1)
+        b0r = offset + t0r
+        b1r = offset + t1r
+        sides_right = np.column_stack([
+            t0r, t1r, b0r,
+            t1r, b1r, b0r,
+        ]).reshape(-1, 3)
 
-        all_faces = np.array(all_faces, dtype=np.int32)
+        all_faces = np.vstack([faces_top, faces_bottom, sides_top, sides_bottom, sides_left, sides_right]).astype(np.int32)
         mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
     else:
-        mesh = top_mesh
+        mesh = trimesh.Trimesh(vertices=verts_top, faces=faces_top.astype(np.int32), process=False)
 
     mesh.merge_vertices()
     trimesh.repair.fix_winding(mesh)
@@ -633,7 +643,10 @@ def image_to_heightmap(
 # EXPORT
 # ---------------------------------------------------------
 
-def export_mesh_bytes(t_mesh: trimesh.Trimesh, file_type: str) -> bytes:
+def export_mesh_bytes(t_mesh: trimesh.Trimesh, file_type: str) -> Tuple[bytes, dict]:
+    """Validate + repair mesh, then export. Returns (bytes, quality_report)."""
+    t_mesh, quality = MeshValidator.validate_and_repair(t_mesh, auto_repair=True)
+
     if file_type == "stl":
         numpy_stl_mesh = stl_mesh.Mesh(
             np.zeros(t_mesh.faces.shape[0], dtype=stl_mesh.Mesh.dtype)
@@ -644,10 +657,10 @@ def export_mesh_bytes(t_mesh: trimesh.Trimesh, file_type: str) -> bytes:
         buffer = io.BytesIO()
         with tempfile.NamedTemporaryFile(suffix=".stl", delete=True) as tmp:
             numpy_stl_mesh.save(tmp.name, fh=buffer, mode=StlMode.BINARY)
-        return buffer.getvalue()
+        return buffer.getvalue(), quality
     elif file_type == "obj":
         obj_str = trimesh.exchange.obj.export_obj(t_mesh)
-        return obj_str.encode("utf-8")
+        return obj_str.encode("utf-8"), quality
     raise ValueError("Unsupported file type")
 
 
@@ -655,15 +668,28 @@ def export_mesh_bytes(t_mesh: trimesh.Trimesh, file_type: str) -> bytes:
 # 3D VIEWER
 # ---------------------------------------------------------
 
-def threejs_viewer_html(vertices: List[List[float]], faces: List[List[int]]) -> str:
+def threejs_viewer_html(vertices: List[List[float]], faces: List[List[int]], auto_fit: bool = True) -> str:
     v_str = json.dumps(vertices)
     f_str = json.dumps(faces)
+
+    # Auto-fit: compute bounding box center and extent for camera placement
+    if auto_fit and vertices:
+        verts_arr = np.array(vertices)
+        center = verts_arr.mean(axis=0).tolist()
+        extent = (verts_arr.max(axis=0) - verts_arr.min(axis=0)).max()
+        cam_dist = max(extent * 1.5, 20)
+    else:
+        center = [0, 0, 0]
+        cam_dist = 55
+
     return f"""
 <!DOCTYPE html>
 <html><head><style>
 body {{ margin:0; overflow:hidden; background:#1a1a2e; }}
 canvas {{ display:block; }}
+#info {{ position:absolute; top:10px; left:10px; color:#8888aa; font:13px monospace; pointer-events:none; }}
 </style></head><body>
+<div id="info"></div>
 <script type="importmap">{{
   "imports": {{
     "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
@@ -676,7 +702,8 @@ import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a2e);
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
-camera.position.set(40, 35, 40);
+camera.position.set({center[0]} + {cam_dist}, {center[1]} + {cam_dist * 0.7}, {center[2]} + {cam_dist});
+camera.lookAt({center[0]}, {center[1]}, {center[2]});
 const renderer = new THREE.WebGLRenderer({{ antialias: true }});
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -686,12 +713,13 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.15;
 controls.autoRotate = true;
 controls.autoRotateSpeed = 1.5;
+controls.target.set({center[0]}, {center[1]}, {center[2]});
 const ambient = new THREE.AmbientLight(0x404060, 1.5);
 scene.add(ambient);
 const dir = new THREE.DirectionalLight(0xffffff, 2);
-dir.position.set(10, 20, 10);
+dir.position.set({center[0] + 10}, {center[1] + 20}, {center[2] + 10});
 scene.add(dir);
-scene.add(new THREE.DirectionalLight(0x8888ff, 0.5).position.set(-10, -5, -10));
+scene.add(new THREE.DirectionalLight(0x8888ff, 0.5));
 const vertices = {v_str};
 const faces = {f_str};
 const geo = new THREE.BufferGeometry();
@@ -703,11 +731,14 @@ geo.computeVertexNormals();
 const mat = new THREE.MeshPhysicalMaterial({{ color: 0x4fc3f7, metalness: 0.1, roughness: 0.4, side: THREE.DoubleSide }});
 const mesh = new THREE.Mesh(geo, mat);
 scene.add(mesh);
-const wire = new THREE.WireframeGeometry(geo);
-const line = new THREE.LineSegments(wire, new THREE.LineBasicMaterial({{ color: 0x1a6b8a, transparent: true, opacity: 0.15 }}));
-mesh.add(line);
+// Wireframe only for small meshes
+if (vertices.length < 50000) {{
+  const wire = new THREE.WireframeGeometry(geo);
+  const line = new THREE.LineSegments(wire, new THREE.LineBasicMaterial({{ color: 0x1a6b8a, transparent: true, opacity: 0.12 }}));
+  mesh.add(line);
+}}
 const grid = new THREE.GridHelper(80, 20, 0x444466, 0x333355);
-grid.position.y = -5;
+grid.position.y = {center[1] - 5};
 scene.add(grid);
 function animate() {{ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }}
 animate();
@@ -821,9 +852,10 @@ def render_heightmap_tab():
                     base_thickness=base, invert=invert, smooth_sigma=smooth,
                     depth_map=depth_map,
                 )
-                file_bytes = export_mesh_bytes(t_mesh, st.session_state.current_file_type)
+                file_bytes, mesh_quality = export_mesh_bytes(t_mesh, st.session_state.current_file_type)
                 st.session_state.current_mesh_data = t_mesh
                 st.session_state.current_file_bytes = file_bytes
+                st.session_state.mesh_quality = mesh_quality
                 st.rerun()
             except Exception as e:
                 st.session_state.error_log = f"Heightmap error: {e}"
@@ -904,9 +936,10 @@ def render_template_tab():
                 else:
                     t_mesh = trimesh.primitives.Box(extents=[30, 30, 30])
 
-                file_bytes = export_mesh_bytes(t_mesh, st.session_state.current_file_type)
+                file_bytes, mesh_quality = export_mesh_bytes(t_mesh, st.session_state.current_file_type)
                 st.session_state.current_mesh_data = t_mesh
                 st.session_state.current_file_bytes = file_bytes
+                st.session_state.mesh_quality = mesh_quality
                 st.rerun()
             except Exception as e:
                 st.session_state.error_log = f"Generation error: {e}\n{traceback.format_exc()}"
@@ -940,9 +973,10 @@ def render_openrouter_tab():
         with st.spinner("Asking AI to generate geometry..."):
             try:
                 t_mesh = generate_with_openrouter(prompt, st.session_state.openrouter_key, model)
-                file_bytes = export_mesh_bytes(t_mesh, st.session_state.current_file_type)
+                file_bytes, mesh_quality = export_mesh_bytes(t_mesh, st.session_state.current_file_type)
                 st.session_state.current_mesh_data = t_mesh
                 st.session_state.current_file_bytes = file_bytes
+                st.session_state.mesh_quality = mesh_quality
                 st.rerun()
             except Exception as e:
                 st.session_state.error_log = f"OpenRouter error: {e}\n{traceback.format_exc()}"
@@ -963,14 +997,43 @@ def render_preview():
 
     verts = mesh.vertices.tolist()
     faces = mesh.faces.tolist()
+    num_verts = len(verts)
+
+    # Vertex warning + auto-simplify for large meshes
+    display_mesh = mesh
+    if num_verts > 100000:
+        st.warning(f"Large mesh ({num_verts:,} vertices). Auto-simplifying for preview...")
+        try:
+            display_mesh = mesh.simplify_quadric_decimation(50000)
+            verts = display_mesh.vertices.tolist()
+            faces = display_mesh.faces.tolist()
+            st.caption(f"Simplified to {len(verts):,} vertices for preview (full mesh preserved in export)")
+        except Exception:
+            st.caption("Simplification failed — showing full mesh (may be slow)")
+
     html = threejs_viewer_html(verts, faces)
     st.components.v1.html(html, height=500)
 
+    # Metrics row
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Vertices", len(mesh.vertices))
+    m1.metric("Vertices", num_verts)
     m2.metric("Faces", len(mesh.faces))
     m3.metric("Volume (mm)", f"{mesh.volume:.1f}" if mesh.is_volume else "N/A")
     m4.metric("Watertight", "Yes" if mesh.is_watertight else "No")
+
+    # Mesh quality report from MeshValidator
+    quality = st.session_state.get("mesh_quality")
+    if quality:
+        with st.expander("Mesh Quality Report"):
+            before = quality.get("before", {})
+            after = quality.get("after", {})
+            col_b, col_a = st.columns(2)
+            with col_b:
+                st.caption("Before repair")
+                st.json(before)
+            with col_a:
+                st.caption("After repair")
+                st.json(after)
 
     with st.expander("Bounds & Dimensions"):
         bounds = mesh.bounds
